@@ -1,0 +1,946 @@
+---
+title: "Analyzing Home Runs"
+author: "Frank Mathews"
+date: "8/5/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Initial setup and EDA
+
+I'll be looking at the dataset from "Sliced", a weekly machine learning competition show which is streamed online.  I saw this dataset on the show and thought it'd be fun to do my own analysis and attempt at building a model.  The follwoing data is included:\
+  1. A CSV which includes many predictor variables, and a target variable (whether or not the hit was a home run).\
+  2. A CSV which includes dimensions of all Major Leage parks.\
+  
+I've loaded in the libraries I'll be using, as well as the data.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE,message = FALSE, fig.width = 8,fig.height = 5)
+
+
+library(tidyverse)
+library(GGally)
+library(ggthemes)
+library(tidymodels)
+library(themis)
+library(rmarkdown)
+library(knitr)
+library(Hmisc)
+library(readr)
+library(kableExtra)
+library(finetune)
+```
+
+```{r include=FALSE}
+bb_train <- read_csv("C:/Users/Frank/OneDrive/R Scripts/Baseball/bb_train.csv")
+
+bb_train <- bb_train%>%
+  filter(pitch_name != "Forkball")
+```
+
+
+```{r include = FALSE}
+park_dimensions <- read_csv("C:/Users/Frank/OneDrive/R Scripts/Baseball/park_dimensions.csv")
+
+```
+
+First, let's take a look at the first 150 rows of the data to see what we're working with:\
+
+```{r}
+bb_train%>%
+  head(150)%>%
+  kbl()%>%
+  kable_paper(c("striped","hover"))%>%
+  scroll_box(width = "100%",height = "500px")
+```
+
+Now I want to see the variable types.  I'll need to address any that are incorrect both for exploratory visualizations and modeling:\
+
+```{r}
+glimpse(bb_train)
+
+```
+
+
+So we have 25 different variables here.  Our target variable will be "is_home_run".  We'll be attempting to predict whether or not a variable is a home run.  We have several variables which are to be considered as predictors.  They are:
+
+
+ - Game Date\
+ - Home Team\
+ - Away Team\
+ - Batter Team\
+ - Batter Name\
+ - Pitcher Name\
+ - Whether or not the batter is left handed\
+ - Whether or not the pitcher is left handed\
+ - The hit type (line drive, pop-up, etc)\
+ - Which direction the ball was hit\
+ - Type of pitch\
+ - The park in which the hit took place\
+ - Inning\
+ - Outs when up\
+ - Balls & Strkes, ie the count\
+ - The coordinates at which the ball crossed the plate\
+ - Pitch Speed\
+ - Launch Speed of the Hit Ball\
+ - Launch Angle of the Hit Ball\
+ - Whether or not the hit was a home run
+ 
+
+Let's make a few visualizations to help determine this.
+
+```{r}
+bb_train%>%
+  filter(is_home_run == 1)%>%
+  ggplot(aes(x = factor(pitch_name,
+                        levels = c("Split-Finger",
+                                   "Knuckle Curve",
+                                   "Cutter",
+                                   "Curveball",
+                                   "Changeup",
+                                   "Sinker",
+                                   "Slider",
+                                   "4-Seam Fastball"))))+geom_bar(fill = 'hotpink',color = 'black')+
+  labs(title = 'Home run distribution across different pitch types',
+       x = "Pitch Type",
+       y = "Count")+coord_flip()+
+  theme_hc()
+```
+
+It would appear as if the type of pitch dramatically impacts whether or not the pitch is a home run, so we'll definitely be using this.  Let's see how pitch_mph, lanch_speed, and launch_angle correllate visually with whether or not the hit resulted in a home run.
+
+I'll first convert the is_home_run variable to a categorical variable
+
+
+```{r}
+bb_train$is_home_run = as.factor(bb_train$is_home_run)
+
+test_vars <- c('launch_speed','launch_angle','pitch_mph')
+
+for (i in test_vars){
+ g <-  ggplot(data = bb_train,aes_string(x =i,group = "is_home_run",fill = 'is_home_run' ))+geom_density(alpha = 0.8)+theme_hc()
+ plot(g)
+}
+```
+
+Launch speed and launch angle both have drasitcally different distributions, so these will undoubtedly need to be included in this analyis.  The distribution across pitch speed, however, is less visually different.  Let's try a t-test to see if the differences between pitch speeds for home runs is and pitch speeds for non home runs are statistically significant.  I'm using an alpha threshold of 0.05.
+
+
+```{r}
+test <- t.test(bb_train$pitch_mph~bb_train$is_home_run)
+print(test)
+```
+
+Even though the mean value across each group is negligibly different, I will still include this in my model as the difference is highly statistically significant.
+
+
+Let's explore the CSV containing park dimensions.
+
+```{r}
+summary(park_dimensions)
+
+```
+
+So it looks like this CSV contains the following information:
+
+ - Park Name\
+ - Whether Or Not The Park Is Indoors vs Outdoors\
+ - Left-Field Dimensions\
+ - Center-Field Dimensions\
+ - Right-Field Dimensions\
+ - Left Wall Height\
+ - Center Wall Height\
+ - Right Wall Height\
+ 
+I'm going to bring this information over into both the training and testing data using an inner join, then I'll make a few more visualizations just for fun.\
+
+```{r}
+bb_train <- inner_join(bb_train,park_dimensions, by = 'park')
+
+bb_train%>%
+  head()%>%
+  kbl()%>%
+  kable_paper(c("striped","hover"))%>%
+  scroll_box(width = "100%",height = "500px")
+```
+
+How does pitch location on the plate affect whether or not the pitch is a home run?  Let's see a heat map.  Shoutout to the legendary Julia Silge for inspiration on this visualization.
+
+```{r}
+#Converting back to numeric for plotting
+
+
+bb_train %>%
+  mutate(is_home_run = as.numeric(is_home_run))%>%
+  mutate(is_home_run = ifelse(is_home_run == 2,1,0))%>%
+  ggplot(aes(plate_x, plate_z, z = is_home_run)) +
+  stat_summary_2d(alpha = 0.8, bins = 20) +
+  scale_fill_continuous(labels = percent) +
+  labs(fill = "Percentage of Home Runs",
+       title = "Heat Map Of Pitch Locations",
+       subtitle = "Home Runs vs Non Home Runs",
+       x = "Plate Left/Right",
+       y = "Plate Up/Down")+
+  theme_minimal()
+
+```
+
+As seen here, the pitch location matters significantly, so this will be included as well.
+
+How does this differ across pitch types?
+
+```{r}
+bb_train %>%
+  mutate(is_home_run = as.numeric(is_home_run))%>%
+  mutate(is_home_run = ifelse(is_home_run == 2,1,0))%>%
+  ggplot(aes(plate_x, plate_z, z = is_home_run)) +
+  stat_summary_2d(alpha = 0.8, bins = 20) +
+  scale_fill_continuous(labels = percent) +facet_wrap(vars(pitch_name),scales = 'free')+
+  labs(title = "Heat Map Of Pitch Locations",
+       subtitle = "By Pitch Type")+theme_minimal()
+
+```
+
+
+I've always wondered how home run hits are distributed across parks.  Let's check that out:
+
+```{r}
+bb_train%>%
+  filter(is_home_run == 1)%>%
+  count(park)%>%
+  arrange(desc(n))%>%
+  inner_join(park_dimensions,by = 'park')%>%
+  select(n,NAME)%>%
+  kbl()%>%
+  kable_paper(c("striped","hover"))%>%
+  scroll_box(width = "100%",height = "500px")
+```
+\
+So from July 23rd, 2020 to October 27th, 2020, Dodger Stadium had the most home run hits of any park in Major League baseball.\
+
+I wonder how this changes when we look at what percentage of hits resulted in home runs?\
+
+```{r}
+bb_train%>%
+  group_by(NAME)%>%
+  summarise(total_hits_in_park = n())%>%
+  left_join(
+    bb_train%>%
+      filter(is_home_run == 1)%>%
+      group_by(NAME)%>%
+      summarise(home_runs_in_park = n())
+  )%>%
+  mutate(percentage_of_hits_are_home_runs = home_runs_in_park/total_hits_in_park)%>%
+  arrange(-percentage_of_hits_are_home_runs)%>%
+  ggplot(aes(x = reorder(NAME, percentage_of_hits_are_home_runs),
+             y = percentage_of_hits_are_home_runs))+
+  geom_col(color = 'black',fill = 'hotpink')+
+  coord_flip()+
+  theme_hc()+
+  labs(
+    title = "Home Run Percentage By MLB Park",
+    x = "MLB Park",
+    y = "Percentage of Hits Resulting In Home Runs"
+  )+
+  geom_text(aes(label = round(percentage_of_hits_are_home_runs,digits = 2),
+                hjust = 1.5))
+```
+\
+
+Wow, I always knew Great American Ballpark was a hitter's park, but I didn't expect to see that one at the top of this list.  I honestly expected to see Coors Field, which is actually in the bottom half.  As they say, data doesn't lie.  To be fair, this is only for one half of one season, but it's still interesting.\
+
+I'm wondering if whether or not the batter was hitting at home or not would affecct the outcome of a home run probability:\
+
+```{r}
+bb_train%>%
+  mutate(hit_at_home = ifelse(batter_team == home_team,"Home","Away"))%>%
+  select(batter_team,home_team,hit_at_home,is_home_run)%>%
+  group_by(hit_at_home,is_home_run)%>%
+  count()%>%
+  mutate(hit_at_home = factor(hit_at_home))%>%
+  mutate(is_home_run = case_when(is_home_run == 1 ~ 'Home Run',
+                                 TRUE ~ "Non-Home Run"))%>%
+  ggplot(aes(x = hit_at_home,y = n))+
+  geom_col(color = 'black',fill = 'hotpink')+
+  facet_wrap(vars(is_home_run),scales = "free")+
+  theme_hc()+labs(
+    title = "Histogram Of Base Hits vs Home Runs",
+    subtitle = "Home vs Away",
+    x = "At Home?",
+    y = "Frequency")
+```
+\
+Interestingly, you have a just slightly higher "chance" of hitting a home run at home vs on the road. I bet this varies significantly by team, though.  If half of your games are played in a pitcher's park (your home stadium), you'd obviously have a higher chance of hitting a home run on the road.  Also interesting is that you're sightly more apt to have a base hit which doesn't result in a home run when you're on the road!\
+
+Since we saw that Great American Ballpark in Cincinnati had the highest percentage of home runs hit, let's see how this plot looks only for the Cincinnati Reds:\
+
+```{r}
+bb_train%>%
+  filter(batter_team == "CIN")%>%
+  mutate(hit_at_home = ifelse(batter_team == home_team,"Home","Away"))%>%
+  select(batter_team,home_team,hit_at_home,is_home_run)%>%
+  group_by(hit_at_home,is_home_run)%>%
+  count()%>%
+  mutate(hit_at_home = factor(hit_at_home))%>%
+  mutate(is_home_run = case_when(is_home_run == 1 ~ 'Home Run',
+                                 TRUE ~ "Non-Home Run"))%>%
+  ggplot(aes(x = hit_at_home,y = n))+
+  geom_col(color = 'black',fill = "#C6011F")+ #Using the Red's color hex code
+  
+  facet_wrap(vars(is_home_run),scales = "free")+
+  theme_hc()+labs(
+    title = "Histogram Of Base Hits vs Home Runs",
+    subtitle = "Home vs Away",
+    x = "At Home?",
+    y = "Frequency",
+    caption = "Cincinnati Reds Players, 2020")
+```
+\
+
+Just as I'd thought, the Reds are a lot more likely to hit home runs at home vs on the road given that half of their games are played in a hitters park.  I remember watching Marcel Ozuna crush a home run into the concourse at Great American Ballpark.  It was surreal.  At the time, it was the longest home run ever hit in that park.\
+
+I'd like to see how this visualization looks for Oakland, the team who plays half their games in the park with the lowest percentage of home runs:\
+
+```{r}
+bb_train%>%
+  filter(batter_team == "OAK")%>%
+  mutate(hit_at_home = ifelse(batter_team == home_team,"Home","Away"))%>%
+  select(batter_team,home_team,hit_at_home,is_home_run)%>%
+  group_by(hit_at_home,is_home_run)%>%
+  count()%>%
+  mutate(hit_at_home = factor(hit_at_home))%>%
+  mutate(is_home_run = case_when(is_home_run == 1 ~ 'Home Run',
+                                 TRUE ~ "Non-Home Run"))%>%
+  ggplot(aes(x = hit_at_home,y = n))+
+  geom_col(color = 'black',fill = "#003831")+ #Using the Red's color hex code
+  
+  facet_wrap(vars(is_home_run),scales = "free")+
+  theme_hc()+labs(
+    title = "Histogram Of Base Hits vs Home Runs",
+    subtitle = "Home vs Away",
+    x = "At Home?",
+    y = "Frequency",
+    caption = "Oakland A's Players, 2020")
+```
+
+
+\
+Let's see how park dimensions affect home runs:
+
+```{r}
+vars <- c("LF_Dim","CF_Dim","RF_Dim","LF_W","CF_W","RF_W")
+for(i in vars){
+  
+g <- bb_train%>%
+  mutate(is_home_run = as.factor(is_home_run))%>%
+  ggplot(aes_string(x = i,fill = 'is_home_run',group = 'is_home_run'))+geom_density(alpha = 0.8)
+
+plot(g)
+}
+
+```
+
+These overall distributions are interesting, but they really don't tell us much.  For instance, let's think about one particular home run. If it's hit to left field, the right field wall height and dimensions mean nothing.  To combat this, let's see how dimensions and wall heights affect home runs hit to that position of the field:
+
+```{r}
+bb_train%>%
+  select(bearing,RF_W,RF_Dim,is_home_run)%>%
+  filter(bearing == 'right',is_home_run == 1)%>%
+  mutate(is_home_run = as.factor(is_home_run))%>%
+  ggplot(aes(x = RF_W))+
+  geom_bar(fill = "hotpink",color = "black")+
+geom_text(stat='count', aes(label=..count..), vjust=-0.5, size = 3,hjust = 0.7)+
+  theme_hc()+labs(
+    title = "Home Run Hits To Right Field Vs Right Field Wall Height",
+    x = 'Right Field Wall Height',
+    y = "Count"
+  )
+```
+
+Wow, this isn't what I expected to see at all.  I expected to see a large skew in the distribution toward the lower end of wall height.  It looks like 8 feet is clearly the winner when it comes to home runs?
+
+So, this bear's the question:  If I'm a left-handed batter in a park with an 8' tall right field wall, do my chances of hitting a home run drastically increase?  Is this the ideal wall height?  I suspect not.  I wonder what the distribution of overall right-field wall heights looks like.  Let us see...\
+
+```{r}
+park_dimensions%>%
+  count(RF_W)%>%
+  arrange(desc(n))%>%
+  kbl()%>%
+  kable_styling(position = "center")%>%
+  kable_paper(c("striped","hover"))
+```
+\
+Just as I thought - 8' is the most common right field wall height.  Let's repeat this for left and center and see if another similar pattern emerges for each.
+
+```{r}
+bb_train%>%
+  select(bearing,LF_W,LF_Dim,is_home_run)%>%
+  filter(bearing == 'left',is_home_run == 1)%>%
+  mutate(is_home_run = as.factor(is_home_run))%>%
+  ggplot(aes(x = LF_W))+
+  geom_bar(fill = "hotpink",color = "black")+
+geom_text(stat='count', aes(label=..count..), vjust=-0.5, size = 3,hjust = 0.7)+
+  theme_hc()+labs(
+    title = "Home Run Hits To Left Field Vs Left Field Wall Height",
+    x = 'Left Field Wall Height',
+    y = "Count"
+  )
+```
+
+
+```{r}
+bb_train%>%
+  select(bearing,CF_W,CF_Dim,is_home_run)%>%
+  filter(bearing == 'center',is_home_run == 1)%>%
+  mutate(is_home_run = as.factor(is_home_run))%>%
+  ggplot(aes(x = CF_W))+
+  geom_bar(fill = "hotpink",color = "black")+
+geom_text(stat='count', aes(label=..count..), vjust=-0.5, size = 3,hjust = 0.7)+
+  theme_hc()+labs(
+    title = "Home Run Hits To Center Field Vs Center Wall Height",
+    x = 'Center Field Wall Height',
+    y = "Count"
+  )
+```
+
+
+So 8 feet seems to be the most common wall height all around.\
+
+I want to take a look at the "hit type" to see which types of hits are more likely to result in home runs.  I believe this will be important for modeling:\
+
+
+```{r}
+bb_train%>%
+  select(bb_type,is_home_run)%>%
+  group_by(bb_type)%>%
+  count(is_home_run)%>%
+  kbl()%>%
+  kable_paper(c("striped","hover"))%>%
+  scroll_box(width = "100%",height = "500px")
+
+```
+\
+Fascinating!  There were no ground balls which resulted in home runs...
+
+Also, we now know there are some N/A values in this variable.  We'll have to address that when it comes to building a model. Let's see how these distrubutions look:
+
+
+```{r}
+bb_train%>%
+  mutate(is_home_run = as.factor(is_home_run))%>%
+  ggplot(aes(x = bb_type,group = is_home_run,fill = is_home_run))+geom_bar(alpha = 0.8)+theme_hc()
+```
+
+So it's pretty apparent that the type of hit is very important in determining whether or not a hit resulted in a home run.
+
+I'm just curious to check a few other things with this data.  I want to see the breakdown of pitch types thrown when the count is full and when the count is 3-0.  Let's check that out:
+
+```{r}
+bb_train%>%
+  mutate(pitch_name = as.factor(pitch_name))%>%
+  filter(balls == 3,strikes ==2)%>%
+  group_by(pitch_name)%>%
+  mutate(when_count_full = n())%>%
+  select(pitch_name,when_count_full)%>%
+  distinct()%>%
+  inner_join(
+    (bb_train%>%
+      filter(balls ==3, strikes == 0)%>%
+      group_by(pitch_name)%>%
+       mutate(when_3_0 = n())%>%
+       select(pitch_name,when_3_0)%>%
+       distinct())
+      ,by = 'pitch_name'
+  )%>%pivot_longer(when_count_full:when_3_0)%>%
+  ggplot(aes(x = pitch_name,y = value))+geom_col(fill = 'hotpink',color = 'black')+
+  facet_wrap(vars(name),scales = 'free')+
+  coord_flip()+theme_hc()
+```
+
+I've always been told that the speed of the pitch determines the speed off of the bat.  Let's see how that corellation looks.  I'll add a regression line for visual clarity.
+
+```{r}
+bb_train%>%
+  mutate(is_home_run = as.factor(is_home_run))%>%
+  mutate(is_home_run = case_when(
+    is_home_run == 1 ~"Home Run",TRUE~"Not A Home Run"
+  ))%>%
+  ggplot(aes(x = pitch_mph,y = launch_speed))+
+  geom_jitter(color = 'hotpink')+
+  geom_smooth(method = 'lm', size = 2,color = 'black')+labs(
+    title = "Comparing Launch Speed With Pitch Speed",
+    subtitle = 'Home Runs Vs Non Home Runs',
+    x = "Pitch Speed",
+    y = "Launch Speed"
+  )+facet_wrap(vars(is_home_run),scales = 'free')+
+  theme_hc()
+```
+
+So there appears to be a slight positive correlation between pitch speed and launch speed for hits that are home runs.  What is apparent, thought, is that we see again that home runs are at the higher end of the launch speed spectrum.  There does exist a positive linear relationship for hits which did not result in a home run, as well.
+
+### Regression Analysis
+
+The statistics nerd inside me is itching to dive a bit deeper into this linear relationship.  I'm going to conduct a quick regression to see what this linear relationship looks like:
+
+```{r}
+reg <- lm(bb_train$launch_speed~bb_train$pitch_mph)
+broom::tidy(reg)%>%
+  select(term,estimate,p.value)%>%
+  kbl()%>%
+  kable_styling(position = "center")%>%
+  kable_paper(c("striped","hover"))
+  
+
+glance(reg)%>%
+  select(r.squared)
+```
+
+Let's take a look at some visuals of this regression:\
+
+```{r}
+plot(reg)
+```
+
+Which batters had the highest average launch speeds in the time period in which this data was collected?
+
+```{r}
+bb_train%>%
+  group_by(batter_name)%>%
+  summarise(avg_launch_speed = mean(launch_speed))%>%
+  arrange(desc(avg_launch_speed))%>%
+  na.omit()%>%
+  head(10)%>%
+  inner_join(bb_train%>%
+               select(batter_name,batter_team),by = 'batter_name'
+             )%>%distinct()%>%
+  kbl()%>%kable_styling(position = "center")%>%
+  kable_paper(c("striped","hover"))
+```
+\
+Wow, as a die-hard Cardinals fan, I wouldn't have thought Austin Dean had such a high launch speed.  I do know he barely played in 2020, so let's take a look at batters who had a minimum of 20 plate appearances to avoid any skewness as a result of small sample size.
+
+```{r}
+
+
+bb_train%>%
+  na.omit()%>%
+  group_by(batter_name)%>%
+  mutate(appearance_count = n())%>%
+  filter(appearance_count >= 20)%>%
+  group_by(batter_name)%>%
+  summarise(avg_launch_speed = mean(launch_speed))%>%
+  arrange(desc(avg_launch_speed))%>%
+  na.omit()%>%
+  head(10)%>%
+  inner_join(bb_train%>%
+               select(batter_name,batter_team),by = 'batter_name'
+             )%>%distinct()%>%
+  kbl()%>%kable_styling(position = "center")%>%
+  kable_paper(c("striped","hover"))
+
+
+```
+
+Perfect, we see a much smaller "grouping" of average launch speeds as well as a more believeable top 10.  
+
+I think I'm ready to begin building a model!
+
+# Model Building
+
+First I'll use a visual to see how many null values we have, then I'll do it my preferred way, using R's sapply() function.
+
+```{r}
+library(naniar)
+gg_miss_var(bb_train)
+```
+
+```{r}
+t(t(sapply(bb_train,function (x) sum(is.na(x)))))
+```
+\
+
+So we have some missing values in the launch_speed and launch_angle variables.  We'll have to address this before building the model.\
+
+Since we determined that absolutely zero ground balls result in home runs (shocker!), let's go ahead and remove all observations which resulted in a ground ball:\
+
+I'll also convert the target variable to a factor.\
+
+```{r}
+bb_train <- bb_train%>%
+  filter(bb_type != "ground_ball")
+
+bb_train$is_home_run <- as.factor(bb_train$is_home_run)
+```
+
+Great - now we'll go ahead and split the data into training and testing:\
+
+```{r}
+split<-initial_split(bb_train,strata = is_home_run)
+df_train <- training(split)
+df_test <- testing(split)
+```
+
+
+```{r}
+df_train%>%
+  count(is_home_run)
+```
+
+We're dealing with some serious class imbalance here.  Normally I'd consider using an ADASYN or a SMOTE to create synthetic examples of the minority class, but given the magnitude of the imbalance, I believe down-sampling the majority class would be more fitting.
+
+## Random Forest
+
+I'm starting with a Random Forest model as they are usually one of the best, if not the best "off the shelf" model.  They tend to perform fairly well with little hyperparameter tuning, are very robust to outliers, include an inherent feature importance, and don't require any scaling or centering.  I usually don't use a Random Forest as a final model, but rather use it to establish a baseline for model performance and identify important features.\
+
+### Preprocessing
+
+I'm using the tidymodels framework to create a preprocessing recipe.  If you're unfamiliar with how this works, I am effectively telling tidymodels how to preprocess the data when the model begins to train.  No preprocessing is actually happening at this time, I'm just writing "instructions" as to how to process the data.  Below I've outlined the steps in detail:
+
+ - I'm starting with setting a seed for reproducability.\
+ - I'm then establishing a formula to let the recipe know which is the target variable\
+ - I then tell the recipe which variables to ignore using the step_rm() function\
+ - Next, I'm coercing any null values in the character variables to "unknown" with step_unknown()\
+ - I'm then using the step_novel() function to coerce any new or previously unseen categories to "new".  
+ - I'm then creating dummy variables for each categorical variable.  I'm using one hot encoding, meaning that each category recieves its own binary column.\
+ - I'm then using a K-Nearest Neighbors algorithm to impute the missing values in the launch speed and launch angle variables.  I'm using pitch_mph,plate_z, and plate_x for the imputation.\
+ - Lastly, I'm applying the downsample to the data, based on the target variable, then applying the step_zv() function which will remove any predictors which have a non-zero variance.  This is a good habit to get into so I make sure to run this with every TidyModels recipe I create.
+ 
+
+I think it's important to emphasize that no changes are being made to the data at this time. I'm simply creating a step-by-step recipe to tell the workflow (which I'll soon create) how to pre-process the data before any model training happens.
+
+
+```{r}
+set.seed(7)
+rf_recipe <- recipe(formula = is_home_run ~.,data = df_train)%>%
+  step_rm(bip_id,game_date,home_team,away_team,batter_team,batter_name,pitcher_name,batter_id,pitcher_id,NAME)%>%
+  step_unknown(all_nominal_predictors())%>%
+  step_novel(all_nominal_predictors())%>%
+  step_dummy(all_nominal_predictors(),one_hot = TRUE)%>%
+  step_impute_knn(launch_speed,launch_angle,
+                  impute_with = imp_vars(pitch_mph,plate_z,plate_x))%>%
+  step_downsample(is_home_run)%>%
+  step_zv(all_numeric_predictors())
+```
+
+
+Here I am prepping the recipe, which "fits" the recipe to the data.  I'm then juicing the recipe to get a raw copy of the pre-processed data.  I'm calling this data "juiced" to differentiate it from the training and testing data.
+
+
+```{r}
+juiced <- rf_recipe%>%
+  prep()%>%
+  juice()
+
+juiced%>%
+  head()%>%
+  kbl()%>%
+  kable_paper(c("striped","hover"))%>%
+  scroll_box(width = "100%",height = "500px")
+
+```
+
+
+Here I'm using the tidymodels framework to build a model.  I'll again break down what I'm doing step-by-step\
+
+  -I'm first assigning the number of cores in my processor to a variable called num_cores.  This will be used for parallel processing.\
+  
+  -I'm then establishing the specifications for the model.  I'll first be using a Random Forest model.  I'm setting the number of trees to 1000, and calling the tune() function on the other two hyperparameters as I'll be tuning them using a grid search.\
+  
+  -I'm then creating a workflow.  The workflow is a set of instructions wrapped into an object.  I am first telling the workflow to apply the preprocessing recipe to the data.  The second step is to add in the model which I've specified.  Workflows are great in that they can store "steps" in one object and can be updated at any time.  This works similarly to Python's pipelines.\
+  
+  -I'm then creating a set of bootstrap samples for cross-validation.  I'm using stratified sampling across each bootstrap sample.  I'm choosing bootstrapping over traditional k-fold cross-validation, as Ramdom Forest models use bootstrap aggregation, so I'm allowing the cross-validation to follow the same methodology.\
+  
+  -Last, I'm creating a tune grid and setting the metric to roc_auc.  I'm using finetune's new race_tune_anova() function which is new to tidymodels.  It works by trying different combinations of hyperparameters and finding a optimal value for each unsing an ANOVA.  Once an optimal value is found, it no longer adjusts that particular hyperparameter.  This can be a significant time saving method as model complexity increases.  This is also advantageous over traditional grid search cross-validation methods as the tuning doesn't continue unless there is a possibility of model improvement.  I've been really excited to try this function and have been waiting for the proper application for which to use it.
+  
+
+
+```{r}
+
+num_cores = parallel::detectCores() 
+
+rf_spec <-  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+  set_mode("classification")%>%
+  set_engine("ranger",num.threads = num_cores)
+
+rf_workflow <- workflow()%>%
+  add_recipe(rf_recipe)%>%
+  add_model(rf_spec)
+
+rf_folds <- bootstraps(df_train,strata = is_home_run,times = 10)
+
+rf_tune <-
+  tune_race_anova(rf_workflow, resamples = rf_folds, grid = 10,
+            metrics = metric_set(roc_auc),
+            control = control_race(verbose = TRUE,
+                                        allow_par = TRUE))
+
+
+```
+
+
+
+Great!  That was easy enough.  Let's see the top performing models as it pertains to roc_auc:
+
+```{r}
+rf_tune%>%
+  show_best(metric = 'roc_auc')%>%
+  kbl()%>%
+  kable_paper(c("striped","hover"))%>%
+  scroll_box(width = "100%",height = "500px")
+```
+
+
+Now let's select the best performing hyperparameter combination and call the model to make sure it's correct:\
+
+```{r}
+rf_best <-
+  rf_tune%>%select_best(metric = "roc_auc")
+
+rf_best
+```
+
+Now I'm going to update my workflow to replace the original model specifications with the hyperparameter-tuned model:\
+
+```{r}
+rf_final <-finalize_workflow(rf_workflow,rf_best)
+
+rf_final
+```
+
+Everything looks good.  Let's officially fit this model to the training data and see how it performs on the testing data.  Tidymodels allows us to do this in one call, using the last_fit() function.\
+
+```{r}
+
+final_results <- rf_final%>%last_fit(split)
+
+final_results%>%
+  collect_metrics()
+```
+
+So we have an AUC of 0.906, not bad at all.  Let's take a look at a confusion matrix to dive a bit further into the model's accuracy:\
+
+```{r}
+preds <- final_results%>%
+  collect_predictions
+
+caret::confusionMatrix(preds$.pred_class,preds$is_home_run, positive = "1")
+```
+\
+And because I like how they look, I'd like to see one of the tidymodels confusion matrices:\
+
+```{r}
+
+
+final_results%>%
+  collect_predictions()%>%
+  conf_mat(is_home_run,.pred_class)%>%
+  autoplot(type = 'heatmap')
+```
+\
+
+As well as this model performed, I think it can be improved upon.  I'd like to take a look at a variable importance plot to determine which variables to use testing different models:\
+
+```{r}
+final_rf <- finalize_model(
+  rf_spec,
+  rf_best
+)
+
+library(vip)
+
+final_rf%>%
+  set_engine('ranger',importance = 'impurity')%>%
+  fit(formula = is_home_run~.,data = rf_recipe%>%prep()%>%juice())%>%
+  vip(num_features = 35)
+```
+\
+
+It's no surprise that launch speed, launch_angle, plate_x, and plate_z are the most important variables when determining whether a hit ball will be a home run.  I was surprised to see pitch speed as high on this list as it is, as well.\
+
+## XGBoost
+\
+
+Next I'll give an XGBoost model a try.  I'll be using only the important variables identified by the Random Forest model.
+
+This recipe is slightly more complex.  I've added step_normalize to scale and center the data, as well as step_zv to remove any predictors which have zero variance again.  I am going to attempt a SMOTE algorithm to generate synthetic samples of the minority class instead of downsampling the majority class.  We'll see how this performs.\
+
+```{r}
+
+xgb_recipe <- recipe(formula = is_home_run ~ launch_speed + launch_angle + plate_x + plate_z + pitch_mph + bb_type + bearing + is_batter_lefty + LF_Dim + CF_Dim + RF_Dim,data = df_train)%>%
+  step_string2factor(bb_type,bearing)%>%
+  step_bin2factor(is_batter_lefty)%>%
+  step_novel(all_nominal_predictors(),-all_outcomes())%>%
+  step_dummy(all_nominal_predictors(), -all_outcomes(),one_hot = TRUE)%>%
+  step_impute_knn(launch_speed,launch_angle,
+                  impute_with = imp_vars(pitch_mph,plate_z,plate_x))%>%
+  step_normalize(all_numeric_predictors())%>%
+  step_zv(all_predictors())%>%
+  step_smote(is_home_run)
+
+juiced <- xgb_recipe%>%
+  prep%>%
+  juice()
+
+
+juiced%>%
+  head(50)%>%
+  kbl()%>%
+  kable_paper(c("striped","hover"))%>%
+  scroll_box(width = "100%",height = "500px")
+  
+```
+
+
+Just like the Random Forest, we'll set the number of trees to 500.  I've also set the stop_iterations hyperparemeter to a value of 40.  An XGBoost bodel will continue to make boosted trees for it's specified number of trees.  By setting this stop_iter to 40, I'm telling the model to stop boosting if the model doesn't improve in performance for 40 iterations of boosted trees.  This is done to prevent model overfitting, and is known "in the lingo" as early-stopping.
+
+```{r}
+xgb_spec <- 
+  boost_tree(trees = 500, 
+             min_n = tune(), 
+             tree_depth = tune(), 
+             learn_rate = tune(), 
+             loss_reduction = tune(), 
+             sample_size = tune(),
+             stop_iter = 40) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost",num.threads = num_cores) 
+
+xgb_workflow <- 
+  workflow() %>% 
+  add_recipe(xgb_recipe) %>% 
+  add_model(xgb_spec)
+
+xgb_folds <- vfold_cv(data = df_train,strata = is_home_run,times = 10)
+
+xgb_tune <-
+  tune_race_anova(xgb_workflow, resamples = xgb_folds, grid = 10,
+            metrics = metric_set(roc_auc,accuracy),
+            control = control_race(verbose = TRUE,
+                                        allow_par = TRUE))
+
+```
+\
+Let's take a look at how each "fold" performed as a result of the race tuning:\
+
+```{r}
+plot_race(xgb_tune)
+```
+\
+Just as before, we'll assign the highest performing model to xgb_best:\
+
+```{r}
+xgb_tune%>%
+  show_best('roc_auc')
+
+xgb_best <-
+  xgb_tune%>%
+  select_best('roc_auc')
+```
+\
+And now we'll finalize our workflow to include the best-performing hyperparameter combinations and take a look at the workflow:\
+
+```{r}
+final_xgb <- finalize_workflow(xgb_workflow,xgb_best)
+final_xgb
+```
+\
+Let's see how the XGBoost model placed importance on variables:\
+
+```{r}
+finalize_model(xgb_spec,xgb_best)%>%
+  set_engine('xgboost',importance = 'impurity')%>%
+  fit(formula = is_home_run~.,data = juiced)%>%
+  vip(num_features = 35)
+```
+\
+We'll take a look at how this model performed:\
+
+```{r}
+final_fit <- final_xgb%>%
+  last_fit(split)
+
+final_fit%>%
+  collect_metrics()
+```
+\
+We can see our accuracy and roc_auc are much higher in comparison to the Random Forest model we created earlier.  Let's use Caret's confusion matrix function again to see some more advanced performance metrics:\
+
+```{r}
+preds <- final_fit%>%
+  collect_predictions
+
+caret::confusionMatrix(preds$.pred_class,preds$is_home_run, positive = "1")
+```
+\
+
+The sensitivity and specificity are much higher than before.  This model, overal, is performing significantly better than the Random Forest.\
+
+I'd like to extract the raw model out and see how the logloss changed with respect to the number of trees boosted by the model:
+
+```{r}
+
+
+raw_xgb <- final_xgb%>%
+  fit(data = df_train)%>%
+  extract_fit_engine()
+```
+\
+
+Now that we've pulled the data, let's plot it out:\
+```{r}
+raw_xgb$evaluation_log%>%
+  ggplot(aes(x = iter,y = training_logloss))+
+  geom_line(color='hotpink',size = 1.2)+
+  labs(x = 'Boosting Iterations',
+       y = 'Model Log-Loss')+
+  theme_hc()
+```
+
+\
+
+We can see the log-loss continued to decrease as more trees were boosted.  We actually never reached that 40 tree early-stopping threshold.
+
+Let's take a look at the final XGBoost Tree:\
+
+```{r out.height="100%",out.width="100%"}
+xgb.plot.tree(model = raw_xgb,trees = 499,plot_width = 1000,plot_height = 1000)
+```
+\
+
+I've recently taken an interest in SHAP values.  From what I understand, a SHAP value can be explained as the difference between the expected value of the model and the actual predicted value.  Each feature, for any given data point, plays a role in determining this difference, and a SHAP summary plot can visualize the differences.  I'll generate a SHAP summary plot and explain it:\
+
+```{r}
+library(SHAPforxgboost)
+
+mat <- as.matrix(juiced[,-17])
+
+xgb.ggplot.shap.summary(data = mat,model = raw_xgb)
+```
+\
+So here we can see the top 10 features in terms of affecting the model output and their respective SHAP values.  The x-axis represents the SHAP value for each feature. A negative SHAP value means that it decreased the probability of a parcitular data point of being a home run.  A positive SHAP value means that it increased the probability of a particular data point being a home run.\
+
+The coloring indicates correlation.  Purple means those data point were highly positively correlated, while yellow means they were highly negatively correlated.  If we look at launch speed, there is a high correllation that higher launch speeds increased the probability of a hit being a home run.  If we look at launch angle, we can see that too low of an angle has a high negative correlation for reducing the probability of a hit being a home run.  We can actually see the sweet spot for launch angle where the strong purple shows.
+
+I'd like to just see a histogram of launch angle for home runs to confirm there is an ideal "sweet spot"
+
+```{r}
+bb_train%>%
+  filter(is_home_run == 1)%>%
+  ggplot(aes(x = launch_angle))+geom_histogram(fill = 'hotpink',color = 'black')
+```
+
+\
+Excellent, the model learned that the sweet spot for launch angle is roughly between 25 and 35 degrees off the bat, just as we'd seen with the SHAP values.
+
+# Takeaways:
+
+It's fairly intuitive that both launch speed and launch angle are significant in determining whether or not a hit is going to be a home run.  But what surprised me?
+
+ - I was very surprised to learn that the correlation between pitch speed and launch speed isn't nearly as strong as what "common knowledge" says.
+ - I was surprised to see how much field dimensions played a role in determining whether or not a hit is a home run.  I knew this would have some effect, but I didn't anticipate this being nearly as significant as it was.
+ - I was very surprised to see that the majority of home runs were hit to center field
+ - Last, I was surprised to see how little the type of pitch mattered.  I figured we'd see a huge spike in the number of home runs from fastballs, but the data didn't support that.
+ 
+
